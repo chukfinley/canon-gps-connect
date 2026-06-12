@@ -166,6 +166,45 @@ PTP/IP session over that WiFi.
   `CCBleConnectService` (`foregroundServiceType="connectedDevice"`) +
   `CCGpsLogService` (`foregroundServiceType="location"`).
 
+## 5c. REGISTRATION + AUTH handshake (REQUIRED before GPS)  — verified vs EOS 250D
+
+The camera ignores the GPS service until the app completes EOS registration/auth.
+Handle→UUID from the capture's GATT discovery; opcodes from `com.canon.eos` `T`/`Q`/`S`.
+
+Identity the clone must own:
+- **initiator GUID** = 16 bytes, generated once (`UUID.randomUUID`), persisted
+  (`AESDKSettings/initiatorGUID`), replayed every connect. Sent as UUID bytes MSB→LSB.
+  Camera stores it at first registration; re-advertises a truncated form so the app
+  recognises "its" camera. Any stable 16 bytes work.
+- **nickname** = free ASCII the app picks + persists (default `NoName`). Shown on the
+  camera. The captured device used `"A015"`. Used in register + auth.
+
+Ordered sequence (after connect + Android `createBond`):
+```
+1. indicate ON  00010005 (state)
+2. write 00010006 = 01 <nickname-ascii>        # S.REQUEST register
+   indicate ON 00010006 ; await indicate:
+     0x02 = S.OK (registered)  0x03 = S.NG (reject -> user must register app on camera)
+3. read 0001000b (capability flags)
+4. notify/indicate ON all chars of services 0x0002 / 0x0003 / 0x0004
+5. write 0001000a (auth, Q enum):
+     03 <16-byte GUID>     # Q.UUID
+     04 <nickname-ascii>   # Q.NICK_NAME
+     05 02                 # Q.TYPE  (constant {5,2})
+6. write 00020002 = 0a  -> camera notifies conn/WiFi info (TLV 7f10…, has 192.168 IP)
+7. write 0001000a = 01   # Q.SUCCESS (auth complete)
+8. camera notifies 00040001 bit1 -> app writes 00040002 = 05 00..00 (8B) ; indicate
+   00040003 = 02 (WANTED) -> stream 20-byte frames (§3b).
+```
+`0001000a` opcode table (Q): 01 SUCCESS, 02 FAILURE, 03 UUID, 04 NICK_NAME, 05 TYPE,
+06/07 MODEL_NAME halves, 08 WIFI_FREQ, 0A PROHIBIT_AUTO_POWER_OFF, 0C WIFI_AP_FREQ.
+
+First-pair vs reconnect: camera advertises (manufacturer id 425) — manuf-data len 19
+carries the registered app GUID (reconnect), len 6 = register mode. `C0276o.w()` returns
+true (needs pairing) when advertised GUID is all-zero; then step 2 runs and the user must
+select the app on the camera. Reconnect skips step 2's wait; identity writes (5) re-sent
+every time.
+
 ## 6. Android manifest essentials (clone needs)
 
 Permissions:

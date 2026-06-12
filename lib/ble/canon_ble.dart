@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -8,29 +9,49 @@ import '../gps/nmea.dart';
 /// Canon BLE UUIDs (reverse-engineered from com.canon.eos.C0224b).
 /// Base pattern: XXXXYYYY-0000-1000-0000-d8492fffa821  (NOTE the 0000- group).
 class CanonUuids {
-  static Guid svc(String x) =>
-      Guid('${x}0000-0000-1000-0000-d8492fffa821');
-  static Guid chr(String x) =>
-      Guid('$x-0000-1000-0000-d8492fffa821');
+  static Guid svc(String x) => Guid('${x}0000-0000-1000-0000-d8492fffa821');
+  static Guid chr(String x) => Guid('$x-0000-1000-0000-d8492fffa821');
 
-  // Primary/advertised service used as the scan filter.
+  // Primary/advertised control service (scan filter).
   static final primaryService = svc('0001');
+  static final ctrlState = chr('00010005'); // indicate: camera state
+  static final ctrlRegister = chr('00010006'); // write+indicate: register/nick
+  static final ctrlAuth = chr('0001000a'); // write: auth opcode channel (Q enum)
+  static final ctrlCapability = chr('0001000b'); // read: feature flags
+
+  // Connection-info service (WiFi/identity handover).
+  static final connInfo = chr('00020002'); // write 0x0a -> notify conn info
+
   // GPS service + characteristics.
   static final gpsService = svc('0004');
-  static final gpsStatus = chr('00040001'); // read/notify: byte0 bit1 = active
-  static final gpsCommand = chr('00040002'); // write: source select / handshake
-  static final gpsSelect = chr('00040003'); // notify: byte1 = source (4=phone)
+  static final gpsStatus = chr('00040001'); // notify: byte0 bit1 = wants loc
+  static final gpsCommand = chr('00040002'); // write: source/handshake/frame
+  static final gpsSelect = chr('00040003'); // indicate: 1=unwanted 2=WANTED ...
+}
+
+/// Auth-channel opcodes written to 0001000a (com.canon.eos.Q enum).
+class _AuthOp {
+  static const success = 0x01; // Q.SUCCESS
+  static const uuid = 0x03; // Q.UUID  + 16-byte initiator GUID
+  static const nickName = 0x04; // Q.NICK_NAME + ascii
+  static const type = 0x05; // Q.TYPE -> constant {5,2}
 }
 
 enum CanonGpsSource { disable, gpsReceiver, builtinGps, builtinGpsOff, smartphone }
 
-enum LinkState { idle, scanning, connecting, connected, bonding, ready }
+enum LinkState { idle, scanning, connecting, connected, bonding, registering, ready }
 
-/// Pairs once, auto-reconnects when the camera powers on (re-advertises the
-/// primary service), and drives the GPS service into SMARTPHONE mode.
-/// Mirrors com.canon.eos.C0240f (scan/reconnect) + C0299u (GPS handshake).
+/// Full EOS BLE client: pairs once, registers + authenticates with the camera
+/// (the handshake the camera REQUIRES before it will accept GPS), auto-reconnects
+/// on power-on, and streams real-time location frames while the camera wants them.
+///
+/// Handshake verified against a real EOS 250D btsnoop capture. Mirrors
+/// com.canon.eos C0276o.B() (registration), T/Q (auth opcodes), C0299u (GPS).
 class CanonBle {
-  static const _prefKey = 'paired_remote_id';
+  static const _prefPaired = 'paired_remote_id';
+  static const _prefGuid = 'initiator_guid';
+  static const _prefNick = 'nickname';
+  static const _defaultNick = 'CCGPS';
 
   final _stateController = StreamController<LinkState>.broadcast();
   Stream<LinkState> get state => _stateController.stream;
@@ -41,14 +62,16 @@ class CanonBle {
   Stream<String> get log => _logController.stream;
 
   BluetoothDevice? _device;
-  BluetoothCharacteristic? _gpsCommand;
-  BluetoothCharacteristic? _gpsStatus;
-  BluetoothCharacteristic? _gpsSelect;
-  StreamSubscription? _scanSub;
-  StreamSubscription? _connSub;
+  // Control-service characteristics.
+  BluetoothCharacteristic? _register, _auth, _capability, _connInfo;
+  // GPS-service characteristics.
+  BluetoothCharacteristic? _gpsCommand, _gpsStatus, _gpsSelect;
+  StreamSubscription? _scanSub, _connSub;
+  final List<StreamSubscription> _valueSubs = [];
+
   bool _wantConnection = false;
   bool _cameraWantsLocation = false;
-  bool _gpsWanted = false; // camera GPS select state == WANTED (00040003 -> 2)
+  bool _gpsWanted = false;
 
   bool get cameraWantsLocation => _cameraWantsLocation;
   bool get gpsWanted => _gpsWanted;
@@ -64,26 +87,53 @@ class CanonBle {
     if (!_logController.isClosed) _logController.add(m);
   }
 
+  // ---- identity (persisted once, replayed every connect) -------------------
+
+  /// 16-byte initiator GUID. Generated once, stored, sent in the 0x03 auth op.
+  /// The camera ties registration to this value — must be stable.
+  Future<List<int>> _identityGuid() async {
+    final prefs = await SharedPreferences.getInstance();
+    var hex = prefs.getString(_prefGuid);
+    if (hex == null) {
+      final r = Random.secure();
+      final b = List<int>.generate(16, (_) => r.nextInt(256));
+      hex = b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
+      await prefs.setString(_prefGuid, hex);
+    }
+    return [
+      for (var i = 0; i < 32; i += 2)
+        int.parse(hex.substring(i, i + 2), radix: 16)
+    ];
+  }
+
+  Future<List<int>> _nickBytes() async {
+    final prefs = await SharedPreferences.getInstance();
+    final nick = prefs.getString(_prefNick) ?? _defaultNick;
+    return nick.codeUnits; // ASCII
+  }
+
+  Future<void> setNickname(String nick) async =>
+      (await SharedPreferences.getInstance()).setString(_prefNick, nick);
+
+  // ---- pairing bookkeeping -------------------------------------------------
+
   Future<String?> pairedId() async =>
-      (await SharedPreferences.getInstance()).getString(_prefKey);
+      (await SharedPreferences.getInstance()).getString(_prefPaired);
 
   Future<void> _savePaired(String id) async =>
-      (await SharedPreferences.getInstance()).setString(_prefKey, id);
+      (await SharedPreferences.getInstance()).setString(_prefPaired, id);
 
   Future<void> forget() async {
     _wantConnection = false;
     await _device?.disconnect();
-    (await SharedPreferences.getInstance()).remove(_prefKey);
+    (await SharedPreferences.getInstance()).remove(_prefPaired);
     _device = null;
     _setState(LinkState.idle);
   }
 
-  /// Start the auto-connect loop. If a device was paired before, reconnect to
-  /// it; otherwise scan for any Canon camera advertising the primary service.
   Future<void> start() async {
     _wantConnection = true;
-    if (await FlutterBluePlus.adapterState.first !=
-        BluetoothAdapterState.on) {
+    if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on) {
       _log('Bluetooth is off');
       return;
     }
@@ -106,7 +156,7 @@ class CanonBle {
     _setState(LinkState.idle);
   }
 
-  // ---- scan (C0240f: ScanFilter on primaryService, LOW_LATENCY) ----
+  // ---- scan (C0240f: ScanFilter on primaryService, LOW_LATENCY) ------------
   Future<void> _scanForCamera() async {
     _setState(LinkState.scanning);
     _log('Scanning for Canon camera…');
@@ -127,68 +177,147 @@ class CanonBle {
     );
   }
 
-  // ---- connect + bond + discover GPS service ----
+  // ---- connect + bond + full registration/auth handshake -------------------
   Future<void> _connect(BluetoothDevice device) async {
     _setState(LinkState.connecting);
     await _connSub?.cancel();
     _connSub = device.connectionState.listen((s) {
-      if (s == BluetoothConnectionState.disconnected) {
-        _onDisconnected();
-      }
+      if (s == BluetoothConnectionState.disconnected) _onDisconnected();
     });
     try {
-      // autoConnect=true makes Android reconnect when the camera powers back on.
       await device.connect(autoConnect: true, mtu: null);
       await device.connectionState
           .firstWhere((s) => s == BluetoothConnectionState.connected);
       _setState(LinkState.connected);
-      _log('Connected — bonding…');
 
-      // One-time pairing/bond (C0224b: createBond after discovery).
       if (await device.bondState.first != BluetoothBondState.bonded) {
         _setState(LinkState.bonding);
+        _log('Bonding…');
         await device.createBond();
       }
       await _savePaired(device.remoteId.str);
-
       try {
         await device.requestMtu(247);
       } catch (_) {}
 
-      await _discoverGps(device);
+      await _runHandshake(device);
       _setState(LinkState.ready);
-      _log('Ready — GPS service in SMARTPHONE mode');
+      _log('Ready — registered & authenticated, awaiting GPS request');
     } catch (e) {
-      _log('Connect failed: $e');
+      _log('Connect/handshake failed: $e');
       _onDisconnected();
     }
   }
 
-  Future<void> _discoverGps(BluetoothDevice device) async {
+  /// The sequence the camera requires before it will send GPS (verified vs
+  /// real EOS 250D btsnoop). Without this the camera ignores the GPS service.
+  Future<void> _runHandshake(BluetoothDevice device) async {
     final services = await device.discoverServices();
+    BluetoothCharacteristic? state;
+    final notifyChars = <BluetoothCharacteristic>[];
+
     for (final s in services) {
-      if (s.uuid == CanonUuids.gpsService) {
-        for (final c in s.characteristics) {
-          if (c.uuid == CanonUuids.gpsCommand) _gpsCommand = c;
-          if (c.uuid == CanonUuids.gpsStatus) _gpsStatus = c;
-          if (c.uuid == CanonUuids.gpsSelect) _gpsSelect = c;
+      for (final c in s.characteristics) {
+        final u = c.uuid;
+        if (u == CanonUuids.ctrlState) state = c;
+        if (u == CanonUuids.ctrlRegister) _register = c;
+        if (u == CanonUuids.ctrlAuth) _auth = c;
+        if (u == CanonUuids.ctrlCapability) _capability = c;
+        if (u == CanonUuids.connInfo) _connInfo = c;
+        if (u == CanonUuids.gpsCommand) _gpsCommand = c;
+        if (u == CanonUuids.gpsStatus) _gpsStatus = c;
+        if (u == CanonUuids.gpsSelect) _gpsSelect = c;
+        // Collect every notify/indicate char on services 0x0002/0x0003/0x0004.
+        final svc = s.uuid.str.substring(0, 4);
+        if ((c.properties.notify || c.properties.indicate) &&
+            (svc == '0002' || svc == '0003' || svc == '0004')) {
+          notifyChars.add(c);
         }
       }
     }
-    if (_gpsStatus != null) {
-      await _gpsStatus!.setNotifyValue(true);
-      _gpsStatus!.onValueReceived.listen(_onGpsStatus);
+    if (_auth == null || _register == null) {
+      throw StateError('Canon control service not found');
     }
-    if (_gpsSelect != null) {
-      await _gpsSelect!.setNotifyValue(true);
-      _gpsSelect!.onValueReceived.listen(_onGpsSelect);
+
+    final guid = await _identityGuid();
+    final nick = await _nickBytes();
+
+    // 1) Enable indicate on camera-state char.
+    if (state != null) await state.setNotifyValue(true);
+
+    // 2) Register: write 0x01 + nickname, enable indicate, await OK (0x02).
+    _setState(LinkState.registering);
+    await _register!.setNotifyValue(true);
+    final regOk = _register!.onValueReceived
+        .firstWhere((v) => v.isNotEmpty && (v[0] == 0x02 || v[0] == 0x03))
+        .timeout(const Duration(seconds: 90), onTimeout: () => const [0x03]);
+    await _register!.write([0x01, ...nick], withoutResponse: false);
+    _log('Registering as "${String.fromCharCodes(nick)}" — confirm on the camera if asked');
+    final reg = await regOk;
+    if (reg.isEmpty || reg[0] != 0x02) {
+      throw StateError(
+          'Camera rejected registration (got ${reg.isEmpty ? "none" : reg[0]}). '
+          'On the camera: Wi-Fi/Bluetooth → connect to smartphone → register this app.');
     }
-    // Tell the camera: use the smartphone as GPS source (8-byte 0x05 handshake).
-    await setGpsSource(CanonGpsSource.smartphone);
+    _log('Registered (camera OK)');
+
+    // 3) Read capability flags (drives feature availability).
+    try {
+      if (_capability != null) await _capability!.read();
+    } catch (_) {}
+
+    // 4) Enable notifications/indications on conn + GPS service chars.
+    for (final c in notifyChars) {
+      try {
+        await c.setNotifyValue(true);
+      } catch (_) {}
+    }
+    _attachGpsListeners();
+
+    // 5) Auth channel (0001000a): UUID, NICK_NAME, TYPE.
+    await _auth!.write([_AuthOp.uuid, ...guid], withoutResponse: false);
+    await _auth!.write([_AuthOp.nickName, ...nick], withoutResponse: false);
+    await _auth!.write([_AuthOp.type, 0x02], withoutResponse: false);
+
+    // 6) Connection-info exchange: write 0x0a, camera notifies back (best-effort).
+    if (_connInfo != null) {
+      try {
+        await _connInfo!.write([0x0a], withoutResponse: false);
+      } catch (_) {}
+    }
+
+    // 7) Auth complete.
+    await _auth!.write([_AuthOp.success], withoutResponse: false);
+    _log('Authenticated');
   }
 
-  // C0299u.b: char 00040003 notify. value[0]: 1=UNWANTED, 2=WANTED, 3=SETUP,
-  // 5=source report (value[1]: 4=SMARTPHONE). WANTED => start streaming fixes.
+  void _attachGpsListeners() {
+    if (_gpsStatus != null) {
+      _valueSubs.add(_gpsStatus!.onValueReceived.listen(_onGpsStatus));
+    }
+    if (_gpsSelect != null) {
+      _valueSubs.add(_gpsSelect!.onValueReceived.listen(_onGpsSelect));
+    }
+  }
+
+  // C0299u.a: status byte0 bit1 (0x02) => camera wants location -> ack with the
+  // 8-byte enable handshake [05,0,0,0,0,0,0,0] on the GPS command char.
+  void _onGpsStatus(List<int> value) async {
+    if (value.isEmpty) return;
+    final active = (value[0] & 0x02) == 0x02;
+    if (active != _cameraWantsLocation) {
+      _cameraWantsLocation = active;
+      _log('Camera GPS active: $active');
+      if (active && _gpsCommand != null) {
+        try {
+          await _gpsCommand!
+              .write([5, 0, 0, 0, 0, 0, 0, 0], withoutResponse: false);
+        } catch (_) {}
+      }
+    }
+  }
+
+  // C0299u.b: 00040003 indicate. byte0: 1=UNWANTED 2=WANTED 3=SETUP 5=source.
   void _onGpsSelect(List<int> value) {
     if (value.isEmpty) return;
     switch (value[0]) {
@@ -201,14 +330,11 @@ class CanonBle {
       case 3:
         _log('Camera GPS: setup');
       case 5:
-        final src = value.length > 1 ? value[1] : -1;
-        _log('Camera GPS source = $src (4=smartphone)');
+        _log('Camera GPS source = ${value.length > 1 ? value[1] : -1} (4=phone)');
     }
   }
 
-  /// Real-time location push over BLE (d4.C0501A.G).
-  /// 20-byte binary frame to GPS command char 00040002, write-no-response.
-  /// Only sent while the camera state is WANTED.
+  /// Real-time location push over BLE (d4.C0501A.G): 20-byte frame to 00040002.
   Future<void> pushLocation(NmeaFix fix) async {
     if (!_gpsWanted || _gpsCommand == null) return;
     final frame = buildBleGpsFrame(
@@ -224,43 +350,24 @@ class CanonBle {
     }
   }
 
-  /// C0276o.I — write source-select byte to the GPS command characteristic.
-  /// Decompiled mapping: index 0->{1}, 1->{2}, 2->{3}.
-  Future<void> setGpsSource(CanonGpsSource src) async {
-    if (_gpsCommand == null) return;
-    // SMARTPHONE handshake: C0299u.a writes [5,0,0,0,0,0,0,0] when enabled.
-    final payload = switch (src) {
-      CanonGpsSource.gpsReceiver => [1],
-      CanonGpsSource.builtinGps => [2],
-      CanonGpsSource.builtinGpsOff => [3],
-      CanonGpsSource.smartphone => [5, 0, 0, 0, 0, 0, 0, 0],
-      CanonGpsSource.disable => [0],
-    };
-    await _gpsCommand!.write(payload, withoutResponse: false);
-    _log('GPS source -> $src');
-  }
-
-  // C0299u.a: status byte0 bit1 (0x02) => camera wants location now.
-  void _onGpsStatus(List<int> value) {
-    if (value.isEmpty) return;
-    final active = (value[0] & 0x02) == 0x02;
-    if (active != _cameraWantsLocation) {
-      _cameraWantsLocation = active;
-      _log('Camera GPS active: $active');
-    }
-  }
-
   void _onDisconnected() {
+    for (final s in _valueSubs) {
+      s.cancel();
+    }
+    _valueSubs.clear();
+    _register = _auth = _capability = _connInfo = null;
     _gpsCommand = _gpsStatus = _gpsSelect = null;
     _cameraWantsLocation = false;
     _gpsWanted = false;
     if (!_wantConnection) return;
     _log('Disconnected — will reconnect when camera powers on');
     _setState(LinkState.scanning);
-    // With autoConnect the OS handles reconnect; also rescan as a fallback.
   }
 
   void dispose() {
+    for (final s in _valueSubs) {
+      s.cancel();
+    }
     _stateController.close();
     _logController.close();
   }
