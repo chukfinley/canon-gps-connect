@@ -57,6 +57,8 @@ class _HomePageState extends State<HomePage> {
     _ble.state.listen((s) => setState(() => _link = s));
     _ble.log.listen(_addLog);
     _gps.fixes.listen((f) async {
+      // Live BLE geotag: push every fix to the camera while it wants location.
+      await _ble.pushLocation(f);
       final c = await widget.db.count();
       if (!mounted) return;
       setState(() {
@@ -151,7 +153,7 @@ class _HomePageState extends State<HomePage> {
             _StatusCard(
               link: _link,
               deviceName: _ble.deviceName,
-              cameraWants: _ble.cameraWantsLocation,
+              cameraWants: _ble.gpsWanted,
               lastFix: _lastFix,
               logCount: _logCount,
               permsOk: _permsOk,
@@ -248,7 +250,7 @@ class _StatusCard extends StatelessWidget {
             _row(
                 'BLE link',
                 link.name +
-                    (cameraWants ? '  • camera wants GPS' : '')),
+                    (cameraWants ? '  • streaming GPS (live)' : '')),
             _row('Permissions', permsOk ? 'ok' : 'needed'),
             _row('Logged fixes', '$logCount'),
             if (lastFix != null)

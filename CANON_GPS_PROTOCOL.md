@@ -80,9 +80,41 @@ Each fix → `i4.C0604a.onLocationChanged` → `i4.j.b()` → stored in:
 - also raw NMEA appended to files in `<filesDir>/.geolog/` (re-imported by `i4.l.e()`).
 - Dedup rule: a fix replaces an existing same-`time` row only if accuracy is better.
 
-## 4. Geotagging photos  (`i4.n`)  — the proprietary "match" step
+## 3b. REAL-TIME location push over BLE  (`d4.C0501A.G(Location)`)  — BLE-ONLY
 
-Canon does NOT stream coordinates per-shot. Instead:
+**Correction to an earlier assumption: the camera DOES get live coordinates over BLE.**
+Method `d4.C0501A.G(Location)` (jadx could not decompile it — recovered via baksmali)
+runs on every fix and, when the camera GPS state is WANTED, writes a **20-byte binary
+frame** to the GPS command characteristic `00040002` (write-no-response):
+
+```
+[0]     0x04  opcode
+[1]     lat hemisphere  0x4E 'N' / 0x53 'S'
+[2:6]   float32 abs(latitude)   little-endian
+[6]     lon hemisphere  0x45 'E' / 0x57 'W'
+[7:11]  float32 abs(longitude)  little-endian
+[11]    alt sign  0x2B '+' / 0x2D '-' / 0x00 (none)
+[12:16] float32 abs(altitude)   little-endian
+[16:20] int32 unix time seconds little-endian
+```
+(NOT the NMEA string — that is only for the WiFi photo-tag path below.)
+
+Gating / state machine (`com.canon.eos.C0299u`):
+- Char `00040001` (status) notify, byte0 bit `0x02` set ⇒ camera active ⇒ phone acks with
+  the 8-byte handshake `05 00 00 00 00 00 00 00` to `00040002`.
+- Char `00040003` (select) notify, byte0: `1`=UNWANTED, `2`=WANTED, `3`=SETUP,
+  `5`=source report (byte1: `4`=SMARTPHONE). On **WANTED** the phone streams the 20-byte
+  frame on every fix (~5–10 s, fused provider). Phone is GATT **client** throughout — it
+  never runs a GATT server and never advertises (verified: zero `BluetoothGattServer` /
+  `BluetoothLeAdvertiser` usage in the whole app).
+
+Confirmed against a real EOS 250D btsnoop capture: phone writes `0500000000000000` to the
+GPS command handle on every (re)connect.
+
+## 4. Geotagging ALREADY-STORED photos  (`i4.n`)  — the WiFi "match" step
+
+This is a SEPARATE feature (retro-tagging existing shots), not the live link above.
+Canon does NOT stream NMEA per-shot for this; instead:
 1. Camera connected → app requests captured-object list for a time window:
    `EOSCamera.F0(startDate, endDate, cb)`  (`attachCameraGpsTagObject`).
 2. For each returned image object's capture timestamp, app finds nearest GPS-log row.

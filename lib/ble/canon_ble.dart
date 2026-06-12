@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../gps/nmea.dart';
+
 /// Canon BLE UUIDs (reverse-engineered from com.canon.eos.C0224b).
 /// Base pattern: XXXXYYYY-0000-1000-0000-d8492fffa821  (NOTE the 0000- group).
 class CanonUuids {
@@ -46,8 +48,10 @@ class CanonBle {
   StreamSubscription? _connSub;
   bool _wantConnection = false;
   bool _cameraWantsLocation = false;
+  bool _gpsWanted = false; // camera GPS select state == WANTED (00040003 -> 2)
 
   bool get cameraWantsLocation => _cameraWantsLocation;
+  bool get gpsWanted => _gpsWanted;
   String? get deviceName => _device?.platformName;
   String? get deviceId => _device?.remoteId.str;
 
@@ -177,9 +181,47 @@ class CanonBle {
     }
     if (_gpsSelect != null) {
       await _gpsSelect!.setNotifyValue(true);
+      _gpsSelect!.onValueReceived.listen(_onGpsSelect);
     }
-    // Tell the camera: use the smartphone as GPS source.
+    // Tell the camera: use the smartphone as GPS source (8-byte 0x05 handshake).
     await setGpsSource(CanonGpsSource.smartphone);
+  }
+
+  // C0299u.b: char 00040003 notify. value[0]: 1=UNWANTED, 2=WANTED, 3=SETUP,
+  // 5=source report (value[1]: 4=SMARTPHONE). WANTED => start streaming fixes.
+  void _onGpsSelect(List<int> value) {
+    if (value.isEmpty) return;
+    switch (value[0]) {
+      case 1:
+        _gpsWanted = false;
+        _log('Camera GPS: not wanted');
+      case 2:
+        _gpsWanted = true;
+        _log('Camera GPS: WANTED — streaming location over BLE');
+      case 3:
+        _log('Camera GPS: setup');
+      case 5:
+        final src = value.length > 1 ? value[1] : -1;
+        _log('Camera GPS source = $src (4=smartphone)');
+    }
+  }
+
+  /// Real-time location push over BLE (d4.C0501A.G).
+  /// 20-byte binary frame to GPS command char 00040002, write-no-response.
+  /// Only sent while the camera state is WANTED.
+  Future<void> pushLocation(NmeaFix fix) async {
+    if (!_gpsWanted || _gpsCommand == null) return;
+    final frame = buildBleGpsFrame(
+      latitude: fix.latitude,
+      longitude: fix.longitude,
+      altitude: fix.altitude,
+      timeMillis: fix.timeMillis,
+    );
+    try {
+      await _gpsCommand!.write(frame, withoutResponse: true);
+    } catch (e) {
+      _log('Location push failed: $e');
+    }
   }
 
   /// C0276o.I — write source-select byte to the GPS command characteristic.
@@ -211,6 +253,7 @@ class CanonBle {
   void _onDisconnected() {
     _gpsCommand = _gpsStatus = _gpsSelect = null;
     _cameraWantsLocation = false;
+    _gpsWanted = false;
     if (!_wantConnection) return;
     _log('Disconnected — will reconnect when camera powers on');
     _setState(LinkState.scanning);

@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:geolocator/geolocator.dart';
 
 /// Exact Dart port of Canon's `i4.j` NMEA builder (decompiled from
@@ -134,3 +136,41 @@ String buildNmea({
 }
 
 String _p2(int v) => v.toString().padLeft(2, '0');
+
+/// Real-time BLE GPS frame — port of `d4.C0501A.G(Location)` (recovered via
+/// baksmali; jadx could not decompile it). 20 bytes, written to the GPS command
+/// characteristic `00040002` while the camera state is WANTED. This is the
+/// BLE-only live geotag path (the camera tags photos as they are shot — no WiFi).
+///
+/// Layout (all multi-byte fields little-endian):
+///   [0]    0x04 opcode
+///   [1]    lat hemisphere: 0x4E 'N' / 0x53 'S'
+///   [2:6]  float32 abs(latitude)
+///   [6]    lon hemisphere: 0x45 'E' / 0x57 'W'
+///   [7:11] float32 abs(longitude)
+///   [11]   alt sign: 0x2B '+' / 0x2D '-' / 0x00 if no altitude
+///   [12:16] float32 abs(altitude)
+///   [16:20] int32 unix time (seconds)
+Uint8List buildBleGpsFrame({
+  required double latitude,
+  required double longitude,
+  required double altitude,
+  required int timeMillis,
+  bool hasAltitude = true,
+}) {
+  final b = ByteData(20);
+  b.setUint8(0, 0x04);
+  b.setUint8(1, latitude < 0 ? 0x53 : 0x4E); // S : N
+  b.setFloat32(2, latitude.abs(), Endian.little);
+  b.setUint8(6, longitude < 0 ? 0x57 : 0x45); // W : E
+  b.setFloat32(7, longitude.abs(), Endian.little);
+  if (!hasAltitude || altitude.isNaN) {
+    b.setUint8(11, 0x00);
+    b.setFloat32(12, 0, Endian.little);
+  } else {
+    b.setUint8(11, altitude < 0 ? 0x2D : 0x2B); // - : +
+    b.setFloat32(12, altitude.abs(), Endian.little);
+  }
+  b.setInt32(16, timeMillis ~/ 1000, Endian.little);
+  return b.buffer.asUint8List();
+}
