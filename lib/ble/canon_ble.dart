@@ -65,13 +65,15 @@ class CanonBle {
   // Control-service characteristics.
   BluetoothCharacteristic? _register, _auth, _capability, _connInfo;
   // GPS-service characteristics.
-  BluetoothCharacteristic? _gpsCommand, _gpsStatus, _gpsSelect;
+  BluetoothCharacteristic? _gpsCommand, _gpsSelect;
   StreamSubscription? _scanSub, _connSub;
   final List<StreamSubscription> _valueSubs = [];
 
   bool _wantConnection = false;
   bool _cameraWantsLocation = false;
   bool _gpsWanted = false;
+  bool _handshaking = false;
+  bool _ready = false;
 
   bool get cameraWantsLocation => _cameraWantsLocation;
   bool get gpsWanted => _gpsWanted;
@@ -171,40 +173,76 @@ class CanonBle {
     _setState(LinkState.idle);
   }
 
-  // ---- scan (C0240f: ScanFilter on primaryService, LOW_LATENCY) ------------
+  // Canon manufacturer id in BLE advertisements (com.canon.eos C0232d).
+  static const _canonManufacturerId = 0x01A9; // 425
+
+  // ---- scan: match Canon manufacturer data, NOT just the service UUID. A
+  // registered camera advertises its real UUID, so a service-UUID-only filter
+  // can miss it (C0232d validates getManufacturerSpecificData(425)). ----------
   Future<void> _scanForCamera() async {
     _setState(LinkState.scanning);
     _log('Scanning for Canon camera…');
     await _scanSub?.cancel();
     _scanSub = FlutterBluePlus.onScanResults.listen((results) async {
-      if (results.isEmpty) return;
-      final r = results.first;
-      await FlutterBluePlus.stopScan();
-      await _scanSub?.cancel();
-      _device = r.device;
-      _log('Found ${r.device.platformName.isEmpty ? r.device.remoteId.str : r.device.platformName}');
-      await _connect(r.device);
+      for (final r in results) {
+        if (!r.advertisementData.manufacturerData
+            .containsKey(_canonManufacturerId)) {
+          continue;
+        }
+        await FlutterBluePlus.stopScan();
+        await _scanSub?.cancel();
+        _scanSub = null;
+        final name = r.device.platformName.isEmpty
+            ? r.device.remoteId.str
+            : r.device.platformName;
+        _log('Found Canon camera: $name');
+        await _connect(r.device);
+        return;
+      }
     });
     await FlutterBluePlus.startScan(
-      withServices: [CanonUuids.primaryService],
       androidScanMode: AndroidScanMode.lowLatency,
-      continuousUpdates: false,
+      continuousUpdates: true,
     );
   }
 
-  // ---- connect + bond + full registration/auth handshake -------------------
+  // ---- connect + bond + handshake; the connectionState listener re-runs the
+  // handshake on every (re)connect and re-arms after a drop. autoConnect=true
+  // lets Android re-link when the camera powers on again. --------------------
   Future<void> _connect(BluetoothDevice device) async {
+    _device = device;
+    _ready = false;
     _setState(LinkState.connecting);
     await _connSub?.cancel();
-    _connSub = device.connectionState.listen((s) {
-      if (s == BluetoothConnectionState.disconnected) _onDisconnected();
+    _connSub = device.connectionState.listen((s) async {
+      if (s == BluetoothConnectionState.connected) {
+        await _onConnected(device);
+      } else if (s == BluetoothConnectionState.disconnected) {
+        _onDisconnected();
+      }
     });
     try {
       await device.connect(autoConnect: true, mtu: null);
-      await device.connectionState
-          .firstWhere((s) => s == BluetoothConnectionState.connected);
-      _setState(LinkState.connected);
+    } catch (e) {
+      _log('connect: $e');
+    }
+    // Fallback: if autoConnect hasn't linked in 25 s, scan for the camera.
+    Future.delayed(const Duration(seconds: 25), () async {
+      if (_wantConnection && !_ready && _state != LinkState.connected) {
+        if (await device.connectionState.first !=
+            BluetoothConnectionState.connected) {
+          _log('Still not connected — rescanning');
+          await _scanForCamera();
+        }
+      }
+    });
+  }
 
+  Future<void> _onConnected(BluetoothDevice device) async {
+    if (_handshaking || _ready) return;
+    _handshaking = true;
+    try {
+      _setState(LinkState.connected);
       if (await device.bondState.first != BluetoothBondState.bonded) {
         _setState(LinkState.bonding);
         _log('Bonding…');
@@ -214,13 +252,17 @@ class CanonBle {
       try {
         await device.requestMtu(247);
       } catch (_) {}
-
       await _runHandshake(device);
+      _ready = true;
       _setState(LinkState.ready);
-      _log('Ready — registered & authenticated, awaiting GPS request');
+      _log('Ready — authenticated, awaiting GPS request');
     } catch (e) {
-      _log('Connect/handshake failed: $e');
-      _onDisconnected();
+      _log('Handshake failed: $e');
+      try {
+        await device.disconnect();
+      } catch (_) {}
+    } finally {
+      _handshaking = false;
     }
   }
 
@@ -240,7 +282,6 @@ class CanonBle {
         if (u == CanonUuids.ctrlCapability) _capability = c;
         if (u == CanonUuids.connInfo) _connInfo = c;
         if (u == CanonUuids.gpsCommand) _gpsCommand = c;
-        if (u == CanonUuids.gpsStatus) _gpsStatus = c;
         if (u == CanonUuids.gpsSelect) _gpsSelect = c;
         // Collect every notify/indicate char on services 0x0002/0x0003/0x0004.
         final svc = s.uuid.str.substring(0, 4);
@@ -267,17 +308,19 @@ class CanonBle {
     //    we skip this entirely and just reconnect+auth (the "connect once" path).
     if (!alreadyRegistered) {
       _setState(LinkState.registering);
+      // S.OK = 0x02 (accept). S.NG = 0x03 is a transient "waiting for the user
+      // to confirm on the camera body" state — keep waiting, don't abort on it.
       final regOk = _register!.onValueReceived
-          .firstWhere((v) => v.isNotEmpty && (v[0] == 0x02 || v[0] == 0x03))
-          .timeout(const Duration(seconds: 90), onTimeout: () => const [0x03]);
+          .firstWhere((v) => v.isNotEmpty && v[0] == 0x02)
+          .timeout(const Duration(seconds: 120), onTimeout: () => const <int>[]);
       await _register!.write([0x01, ...nick], withoutResponse: false);
       _log('First-time registration as "${String.fromCharCodes(nick)}" — '
           'confirm on the camera (connect to smartphone → register device)');
       final reg = await regOk;
       if (reg.isEmpty || reg[0] != 0x02) {
         throw StateError(
-            'Camera rejected registration (got ${reg.isEmpty ? "none" : reg[0]}). '
-            'On the camera: Wi-Fi/Bluetooth → connect to smartphone → register this app, then retry.');
+            'Registration not confirmed on the camera. On the camera: '
+            'Wi-Fi/Bluetooth → connect to smartphone → register this device, then retry.');
       }
       await _setRegistered(id);
       _log('Registered & saved — future connects are automatic');
@@ -303,10 +346,14 @@ class CanonBle {
     await _auth!.write([_AuthOp.nickName, ...nick], withoutResponse: false);
     await _auth!.write([_AuthOp.type, 0x02], withoutResponse: false);
 
-    // 6) Connection-info exchange: write 0x0a, camera notifies back (best-effort).
+    // 6) Connection-info exchange: write 0x0a, AWAIT the camera's notify before
+    //    completing auth (official app gates SUCCESS on this — B.a()).
     if (_connInfo != null) {
       try {
+        final notif = _connInfo!.onValueReceived.first
+            .timeout(const Duration(seconds: 5), onTimeout: () => const <int>[]);
         await _connInfo!.write([0x0a], withoutResponse: false);
+        await notif;
       } catch (_) {}
     }
 
@@ -316,41 +363,40 @@ class CanonBle {
   }
 
   void _attachGpsListeners() {
-    if (_gpsStatus != null) {
-      _valueSubs.add(_gpsStatus!.onValueReceived.listen(_onGpsStatus));
+    // Guard against double-attach if the handshake re-runs without a disconnect.
+    for (final s in _valueSubs) {
+      s.cancel();
     }
+    _valueSubs.clear();
     if (_gpsSelect != null) {
       _valueSubs.add(_gpsSelect!.onValueReceived.listen(_onGpsSelect));
     }
   }
 
-  // C0299u.a: status byte0 bit1 (0x02) => camera wants location -> ack with the
-  // 8-byte enable handshake [05,0,0,0,0,0,0,0] on the GPS command char.
-  void _onGpsStatus(List<int> value) async {
-    if (value.isEmpty) return;
-    final active = (value[0] & 0x02) == 0x02;
-    if (active != _cameraWantsLocation) {
-      _cameraWantsLocation = active;
-      _log('Camera GPS active: $active');
-      if (active && _gpsCommand != null) {
-        try {
-          await _gpsCommand!
-              .write([5, 0, 0, 0, 0, 0, 0, 0], withoutResponse: false);
-        } catch (_) {}
-      }
-    }
+  /// Send the 8-byte enable handshake (C0299u.a: [05,0,0,0,0,0,0,0]) to the GPS
+  /// command char so the camera starts/keeps the smartphone GPS source.
+  Future<void> _sendGpsEnable() async {
+    if (_gpsCommand == null) return;
+    try {
+      await _gpsCommand!
+          .write([5, 0, 0, 0, 0, 0, 0, 0], withoutResponse: false);
+    } catch (_) {}
   }
 
   // C0299u.b: 00040003 indicate. byte0: 1=UNWANTED 2=WANTED 3=SETUP 5=source.
+  // (00040001 status is read-only on this camera, so WANTED comes via select.)
   void _onGpsSelect(List<int> value) {
     if (value.isEmpty) return;
     switch (value[0]) {
       case 1:
         _gpsWanted = false;
+        _cameraWantsLocation = false;
         _log('Camera GPS: not wanted');
       case 2:
         _gpsWanted = true;
+        _cameraWantsLocation = true;
         _log('Camera GPS: WANTED — streaming location over BLE');
+        _sendGpsEnable();
       case 3:
         _log('Camera GPS: setup');
       case 5:
@@ -380,12 +426,25 @@ class CanonBle {
     }
     _valueSubs.clear();
     _register = _auth = _capability = _connInfo = null;
-    _gpsCommand = _gpsStatus = _gpsSelect = null;
+    _gpsCommand = _gpsSelect = null;
     _cameraWantsLocation = false;
     _gpsWanted = false;
+    _ready = false;
+    _handshaking = false;
     if (!_wantConnection) return;
+    // Keep _connSub alive: with autoConnect=true Android re-links when the
+    // camera powers on again, and the connectionState listener re-runs the
+    // handshake via _onConnected. As a fallback, rescan after a short backoff.
     _log('Disconnected — will reconnect when camera powers on');
     _setState(LinkState.scanning);
+    Future.delayed(const Duration(seconds: 20), () async {
+      if (_wantConnection && !_ready && _device != null) {
+        if (await _device!.connectionState.first !=
+            BluetoothConnectionState.connected) {
+          await _scanForCamera();
+        }
+      }
+    });
   }
 
   void dispose() {

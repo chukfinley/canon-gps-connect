@@ -57,3 +57,16 @@ flutter run            # arm64 device
 ```
 First launch: grant Location (allow **all the time**) + Nearby devices, tap **Start**,
 turn the camera on → it pairs once, then auto-reconnects on every power-on.
+
+## Behaviour (audited against the official app + a real EOS 250D capture)
+- **Register once:** the `00010006` register write runs only on first pairing (camera must
+  be in "register device" mode); a persisted flag makes every later connect silent.
+- **Auto-resume:** on app launch, if a camera is paired and permissions are granted, it
+  reconnects automatically — no manual tap.
+- **Scan match:** scans for Canon **manufacturer id 425 (0x01A9)**, not just the service
+  UUID (a registered camera advertises its real UUID, which a UUID-only filter can miss).
+- **Reconnect:** `autoConnect` re-links when the camera powers on; the connection listener
+  re-runs the handshake, with a rescan fallback.
+- **Background:** the location foreground service keeps the process (and the BLE link) alive
+  while tracking runs. **Known limit:** force-swiping the app from recents on some OEMs can
+  still kill it (the official app has the same risk); reopen to resume.

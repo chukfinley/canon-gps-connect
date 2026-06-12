@@ -67,6 +67,17 @@ class _HomePageState extends State<HomePage> {
       });
     });
     _refreshCount();
+    _maybeAutoResume();
+  }
+
+  // If a camera is already paired and location is granted, resume on launch —
+  // the official app reconnects on its own without a manual tap.
+  Future<void> _maybeAutoResume() async {
+    if (await _ble.pairedId() == null) return;
+    if (!await Permission.locationWhenInUse.isGranted) return;
+    if (!await Permission.bluetoothConnect.isGranted) return;
+    _addLog('Resuming saved camera…');
+    await _startAll();
   }
 
   Future<void> _refreshCount() async {
@@ -83,19 +94,33 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<bool> _ensurePermissions() async {
-    await [
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.locationWhenInUse,
-      Permission.notification,
-    ].request();
-    // Background location must be requested separately, after while-in-use.
-    final bg = await Permission.locationAlways.request();
-    final ok = await Permission.locationWhenInUse.isGranted &&
-        await Permission.bluetoothConnect.isGranted;
+    // Nearby devices + notifications.
+    await Permission.bluetoothScan.request();
+    await Permission.bluetoothConnect.request();
+    await Permission.notification.request();
+
+    // Location: while-in-use FIRST and confirm it before asking for background.
+    // Android 12+ rejects a background-location prompt that isn't a separate
+    // step after while-in-use is already granted.
+    if (!await Permission.locationWhenInUse.isGranted) {
+      await Permission.locationWhenInUse.request();
+    }
+    final fine = await Permission.locationWhenInUse.isGranted;
+
+    var bgGranted = await Permission.locationAlways.isGranted;
+    if (fine && !bgGranted) {
+      final bg = await Permission.locationAlways.request();
+      bgGranted = bg.isGranted;
+      if (!bgGranted) {
+        _addLog('Tip: set Location to "Allow all the time" in settings for '
+            'background tracking');
+      }
+    }
+
+    final ok = fine && await Permission.bluetoothConnect.isGranted;
     _addLog(ok
-        ? 'Permissions granted (background: ${bg.isGranted})'
-        : 'Permissions missing — enable in settings');
+        ? 'Permissions OK (background: $bgGranted)'
+        : 'Need Location + Nearby devices — enable in settings');
     if (mounted) setState(() => _permsOk = ok);
     return ok;
   }
