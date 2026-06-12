@@ -1,301 +1,385 @@
 import 'package:flutter/material.dart';
-import 'package:geolocator/geolocator.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-import 'ble/canon_ble.dart';
-import 'geotag/geotag_sync.dart';
-import 'gps/gps_service.dart';
-import 'gps/log_db.dart';
-import 'gps/nmea.dart';
+import 'service/canon_task_handler.dart';
+import 'settings.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  final db = await GpsLogDb.open();
-  runApp(CanonGpsApp(db: db));
+  // Port for UI <-> foreground-service-isolate messages.
+  FlutterForegroundTask.initCommunicationPort();
+  runApp(const CanonGpsApp());
 }
 
 class CanonGpsApp extends StatelessWidget {
-  const CanonGpsApp({super.key, required this.db});
-  final GpsLogDb db;
-
+  const CanonGpsApp({super.key});
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Canon GPS Connect',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorSchemeSeed: const Color(0xFFCC0000),
+        colorSchemeSeed: const Color(0xFFE60012),
         brightness: Brightness.dark,
         useMaterial3: true,
       ),
-      home: HomePage(db: db),
+      // Handles relaunch from the service notification.
+      home: const WithForegroundTask(child: HomePage()),
     );
   }
 }
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key, required this.db});
-  final GpsLogDb db;
-
+  const HomePage({super.key});
   @override
   State<HomePage> createState() => _HomePageState();
 }
 
 class _HomePageState extends State<HomePage> {
-  late final GpsService _gps = GpsService(widget.db);
-  late final CanonBle _ble = CanonBle();
-  late final GeotagSync _geotag = GeotagSync(widget.db);
-
+  bool _running = false;
+  String _state = 'idle';
+  String? _device;
+  bool _wanted = false;
+  double? _lat, _lon;
+  int _interval = Settings.defaultInterval;
   final List<String> _log = [];
-  LinkState _link = LinkState.idle;
-  NmeaFix? _lastFix;
-  int _logCount = 0;
-  bool _permsOk = false;
 
   @override
   void initState() {
     super.initState();
-    _ble.state.listen((s) => setState(() => _link = s));
-    _ble.log.listen(_addLog);
-    _gps.fixes.listen((f) async {
-      // Live BLE geotag: push every fix to the camera while it wants location.
-      await _ble.pushLocation(f);
-      final c = await widget.db.count();
-      if (!mounted) return;
-      setState(() {
-        _lastFix = f;
-        _logCount = c;
-      });
-    });
-    _refreshCount();
-    _maybeAutoResume();
-  }
-
-  // If a camera is already paired and location is granted, resume on launch —
-  // the official app reconnects on its own without a manual tap.
-  Future<void> _maybeAutoResume() async {
-    if (await _ble.pairedId() == null) return;
-    if (!await Permission.locationWhenInUse.isGranted) return;
-    if (!await Permission.bluetoothConnect.isGranted) return;
-    _addLog('Resuming saved camera…');
-    await _startAll();
-  }
-
-  Future<void> _refreshCount() async {
-    final c = await widget.db.count();
-    if (mounted) setState(() => _logCount = c);
-  }
-
-  void _addLog(String m) {
-    if (!mounted) return;
-    setState(() {
-      _log.insert(0, m);
-      if (_log.length > 60) _log.removeLast();
-    });
-  }
-
-  Future<bool> _ensurePermissions() async {
-    // Nearby devices + notifications.
-    await Permission.bluetoothScan.request();
-    await Permission.bluetoothConnect.request();
-    await Permission.notification.request();
-
-    // Location: while-in-use FIRST and confirm it before asking for background.
-    // Android 12+ rejects a background-location prompt that isn't a separate
-    // step after while-in-use is already granted.
-    if (!await Permission.locationWhenInUse.isGranted) {
-      await Permission.locationWhenInUse.request();
-    }
-    final fine = await Permission.locationWhenInUse.isGranted;
-
-    var bgGranted = await Permission.locationAlways.isGranted;
-    if (fine && !bgGranted) {
-      final bg = await Permission.locationAlways.request();
-      bgGranted = bg.isGranted;
-      if (!bgGranted) {
-        _addLog('Tip: set Location to "Allow all the time" in settings for '
-            'background tracking');
-      }
-    }
-
-    final ok = fine && await Permission.bluetoothConnect.isGranted;
-    _addLog(ok
-        ? 'Permissions OK (background: $bgGranted)'
-        : 'Need Location + Nearby devices — enable in settings');
-    if (mounted) setState(() => _permsOk = ok);
-    return ok;
-  }
-
-  Future<void> _startAll() async {
-    if (!await _ensurePermissions()) return;
-    if (!await Geolocator.isLocationServiceEnabled()) {
-      _addLog('Turn on device location services');
-      return;
-    }
-    await _gps.start();
-    _addLog('GPS logging started (10s, high accuracy)');
-    await _ble.start();
-    setState(() {});
-  }
-
-  Future<void> _stopAll() async {
-    await _gps.stop();
-    await _ble.stop();
-    _addLog('Stopped');
-    setState(() {});
-  }
-
-  Future<void> _syncNow() async {
-    _addLog('Geotag sync: join the camera WiFi first, then run this.');
-    try {
-      final rc = await _geotag.init();
-      if (rc != 0) {
-        _addLog('IMLink init failed rc=$rc (on camera WiFi?)');
-        return;
-      }
-      final now = DateTime.now().toUtc();
-      final res = await _geotag.syncRange(
-        now.subtract(const Duration(days: 2)),
-        now,
-        onLog: _addLog,
-      );
-      _addLog('Done: tagged ${res.tagged}, skipped ${res.skipped}');
-      await _geotag.destroy();
-    } catch (e) {
-      _addLog('Sync error: $e');
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final running = _gps.running;
-    return Scaffold(
-      appBar: AppBar(title: const Text('Canon GPS Connect')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            _StatusCard(
-              link: _link,
-              deviceName: _ble.deviceName,
-              cameraWants: _ble.gpsWanted,
-              lastFix: _lastFix,
-              logCount: _logCount,
-              permsOk: _permsOk,
-            ),
-            const SizedBox(height: 12),
-            Row(children: [
-              Expanded(
-                child: FilledButton.icon(
-                  onPressed: running ? null : _startAll,
-                  icon: const Icon(Icons.play_arrow),
-                  label: const Text('Start'),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: running ? _stopAll : null,
-                  icon: const Icon(Icons.stop),
-                  label: const Text('Stop'),
-                ),
-              ),
-            ]),
-            const SizedBox(height: 8),
-            Row(children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: _syncNow,
-                  icon: const Icon(Icons.wifi_find),
-                  label: const Text('Geotag photos now (WiFi)'),
-                ),
-              ),
-              const SizedBox(width: 8),
-              IconButton(
-                tooltip: 'Forget camera',
-                onPressed: () => _ble.forget(),
-                icon: const Icon(Icons.link_off),
-              ),
-            ]),
-            const SizedBox(height: 12),
-            const Text('Activity',
-                style: TextStyle(fontWeight: FontWeight.bold)),
-            const Divider(),
-            Expanded(
-              child: ListView.builder(
-                itemCount: _log.length,
-                itemBuilder: (_, i) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 2),
-                  child: Text(_log[i],
-                      style: const TextStyle(
-                          fontSize: 12, fontFamily: 'monospace')),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
+    FlutterForegroundTask.addTaskDataCallback(_onData);
+    _bootstrap();
   }
 
   @override
   void dispose() {
-    _gps.dispose();
-    _ble.dispose();
+    FlutterForegroundTask.removeTaskDataCallback(_onData);
     super.dispose();
   }
-}
 
-class _StatusCard extends StatelessWidget {
-  const _StatusCard({
-    required this.link,
-    required this.deviceName,
-    required this.cameraWants,
-    required this.lastFix,
-    required this.logCount,
-    required this.permsOk,
-  });
+  Future<void> _bootstrap() async {
+    _interval = await Settings.intervalSeconds();
+    await _initFgs();
+    _running = await FlutterForegroundTask.isRunningService;
+    if (mounted) setState(() {});
+  }
 
-  final LinkState link;
-  final String? deviceName;
-  final bool cameraWants;
-  final NmeaFix? lastFix;
-  final int logCount;
-  final bool permsOk;
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _row('Camera', deviceName ?? 'not paired'),
-            _row(
-                'BLE link',
-                link.name +
-                    (cameraWants ? '  • streaming GPS (live)' : '')),
-            _row('Permissions', permsOk ? 'ok' : 'needed'),
-            _row('Logged fixes', '$logCount'),
-            if (lastFix != null)
-              _row('Last fix',
-                  '${lastFix!.latitude.toStringAsFixed(5)}, ${lastFix!.longitude.toStringAsFixed(5)}'),
-          ],
-        ),
+  Future<void> _initFgs() async {
+    FlutterForegroundTask.init(
+      androidNotificationOptions: AndroidNotificationOptions(
+        channelId: 'canon_gps',
+        channelName: 'Canon GPS Connect',
+        channelDescription: 'Keeps the camera connection and GPS alive',
+        onlyAlertOnce: true,
+      ),
+      iosNotificationOptions: const IOSNotificationOptions(),
+      foregroundTaskOptions: ForegroundTaskOptions(
+        // Low-power: tick rarely just to refresh status; GPS itself is driven
+        // on-demand by the camera, not by this event.
+        eventAction: ForegroundTaskEventAction.repeat(15000),
+        autoRunOnBoot: true,
+        autoRunOnMyPackageReplaced: true,
+        allowWakeLock: true,
+        allowWifiLock: false,
       ),
     );
   }
 
-  Widget _row(String k, String v) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 3),
-        child: Row(
-          children: [
-            SizedBox(
-                width: 120,
-                child: Text(k, style: const TextStyle(color: Colors.grey))),
-            Expanded(child: Text(v)),
+  void _onData(Object data) {
+    if (data is! Map) return;
+    if (data['log'] is String) {
+      setState(() {
+        _log.insert(0, data['log'] as String);
+        if (_log.length > 80) _log.removeLast();
+      });
+    }
+    final s = data['status'];
+    if (s is Map) {
+      setState(() {
+        _state = (s['state'] as String?) ?? _state;
+        _device = s['device'] as String?;
+        _wanted = (s['wanted'] as bool?) ?? false;
+        _interval = (s['interval'] as num?)?.toInt() ?? _interval;
+        if (s['lat'] is num) _lat = (s['lat'] as num).toDouble();
+        if (s['lon'] is num) _lon = (s['lon'] as num).toDouble();
+      });
+    }
+  }
+
+  Future<bool> _ensurePermissions() async {
+    await FlutterForegroundTask.requestNotificationPermission();
+    await Permission.bluetoothScan.request();
+    await Permission.bluetoothConnect.request();
+    if (!await Permission.locationWhenInUse.isGranted) {
+      await Permission.locationWhenInUse.request();
+    }
+    final fine = await Permission.locationWhenInUse.isGranted;
+    if (fine && !await Permission.locationAlways.isGranted) {
+      await Permission.locationAlways.request();
+    }
+    // Best-effort: ask the OS to exempt us from battery optimisation so the
+    // service survives Doze (this does NOT increase battery use — GPS is still
+    // on-demand; it just stops the OS from killing the connection).
+    if (!await FlutterForegroundTask.isIgnoringBatteryOptimizations) {
+      await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+    }
+    final ok = fine && await Permission.bluetoothConnect.isGranted;
+    if (!ok) _toast('Grant Location + Nearby devices to start');
+    return ok;
+  }
+
+  Future<void> _start() async {
+    if (!await _ensurePermissions()) return;
+    await FlutterForegroundTask.startService(
+      serviceId: 256,
+      notificationTitle: 'Canon GPS Connect',
+      notificationText: 'Searching for your camera…',
+      callback: startCallback,
+    );
+    setState(() => _running = true);
+  }
+
+  Future<void> _stop() async {
+    await FlutterForegroundTask.stopService();
+    setState(() {
+      _running = false;
+      _state = 'idle';
+      _wanted = false;
+    });
+  }
+
+  Future<void> _setInterval(int v) async {
+    await Settings.setIntervalSeconds(v);
+    setState(() => _interval = v);
+    if (_running) {
+      FlutterForegroundTask.sendDataToTask({'cmd': 'setInterval', 'value': v});
+    }
+  }
+
+  void _forget() {
+    FlutterForegroundTask.sendDataToTask({'cmd': 'forget'});
+    _toast('Camera forgotten — will re-pair next time');
+  }
+
+  void _toast(String m) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(m), duration: const Duration(seconds: 2)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Canon GPS Connect'),
+        actions: [
+          IconButton(
+            tooltip: 'Forget camera',
+            onPressed: _running ? _forget : null,
+            icon: const Icon(Icons.link_off),
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          _StatusHero(
+            running: _running,
+            state: _state,
+            device: _device,
+            wanted: _wanted,
+            lat: _lat,
+            lon: _lon,
+          ),
+          const SizedBox(height: 20),
+          SizedBox(
+            height: 56,
+            child: _running
+                ? OutlinedButton.icon(
+                    onPressed: _stop,
+                    icon: const Icon(Icons.stop),
+                    label: const Text('Stop service'),
+                  )
+                : FilledButton.icon(
+                    onPressed: _start,
+                    icon: const Icon(Icons.power_settings_new),
+                    label: const Text('Start — connect & track'),
+                  ),
+          ),
+          const SizedBox(height: 24),
+          Text('GPS update rate',
+              style: TextStyle(color: cs.onSurfaceVariant, fontSize: 13)),
+          const SizedBox(height: 8),
+          _IntervalSelector(value: _interval, onChanged: _setInterval),
+          const SizedBox(height: 6),
+          Text(
+            'GPS only runs while the camera asks for it. Faster = smoother track, more battery.',
+            style: TextStyle(color: cs.onSurfaceVariant, fontSize: 12),
+          ),
+          const SizedBox(height: 24),
+          _LogPanel(lines: _log),
+        ],
+      ),
+    );
+  }
+}
+
+class _StatusHero extends StatelessWidget {
+  const _StatusHero({
+    required this.running,
+    required this.state,
+    required this.device,
+    required this.wanted,
+    required this.lat,
+    required this.lon,
+  });
+  final bool running;
+  final String state;
+  final String? device;
+  final bool wanted;
+  final double? lat, lon;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final (icon, color, label) = !running
+        ? (Icons.power_off, cs.outline, 'Service stopped')
+        : wanted
+            ? (Icons.gps_fixed, const Color(0xFF22C55E), 'Streaming GPS to camera')
+            : state == 'ready' || state == 'connected'
+                ? (Icons.bluetooth_connected, cs.primary, 'Connected — idle')
+                : (Icons.bluetooth_searching, cs.tertiary, _pretty(state));
+
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 56,
+                height: 56,
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: 0.15),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(icon, color: color, size: 30),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(label,
+                        style: const TextStyle(
+                            fontSize: 18, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 2),
+                    Text(device ?? (running ? 'No camera yet' : 'Press start'),
+                        style: TextStyle(color: cs.onSurfaceVariant)),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          if (lat != null && lon != null) ...[
+            const SizedBox(height: 16),
+            const Divider(height: 1),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Icon(Icons.place, size: 18, color: cs.onSurfaceVariant),
+                const SizedBox(width: 8),
+                Text(
+                  '${lat!.toStringAsFixed(5)},  ${lon!.toStringAsFixed(5)}',
+                  style: const TextStyle(
+                      fontFamily: 'monospace', fontSize: 15),
+                ),
+              ],
+            ),
           ],
-        ),
-      );
+        ],
+      ),
+    );
+  }
+
+  String _pretty(String s) => switch (s) {
+        'scanning' => 'Searching for camera…',
+        'connecting' => 'Connecting…',
+        'bonding' => 'Pairing…',
+        'registering' => 'Registering on camera…',
+        _ => 'Working…',
+      };
+}
+
+class _IntervalSelector extends StatelessWidget {
+  const _IntervalSelector({required this.value, required this.onChanged});
+  final int value;
+  final ValueChanged<int> onChanged;
+
+  String _label(int s) => s < 60 ? '${s}s' : '${s ~/ 60}m';
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 8,
+      children: Settings.intervalOptions.map((s) {
+        final sel = s == value;
+        return ChoiceChip(
+          label: Text(_label(s)),
+          selected: sel,
+          onSelected: (_) => onChanged(s),
+        );
+      }).toList(),
+    );
+  }
+}
+
+class _LogPanel extends StatelessWidget {
+  const _LogPanel({required this.lines});
+  final List<String> lines;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Theme(
+      data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+      child: ExpansionTile(
+        initiallyExpanded: false, // collapsed by default
+        tilePadding: EdgeInsets.zero,
+        childrenPadding: const EdgeInsets.only(top: 4, bottom: 8),
+        title: Text('Activity log (${lines.length})',
+            style: TextStyle(color: cs.onSurfaceVariant, fontSize: 14)),
+        children: [
+          Container(
+            constraints: const BoxConstraints(maxHeight: 260),
+            decoration: BoxDecoration(
+              color: cs.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            padding: const EdgeInsets.all(12),
+            child: lines.isEmpty
+                ? Text('No activity yet',
+                    style: TextStyle(color: cs.onSurfaceVariant))
+                : ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: lines.length,
+                    itemBuilder: (_, i) => Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2),
+                      child: Text(lines[i],
+                          style: const TextStyle(
+                              fontSize: 12, fontFamily: 'monospace')),
+                    ),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
 }

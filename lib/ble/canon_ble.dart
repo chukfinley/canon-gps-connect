@@ -61,6 +61,11 @@ class CanonBle {
   final _logController = StreamController<String>.broadcast();
   Stream<String> get log => _logController.stream;
 
+  // Emits when the camera starts (true) / stops (false) wanting location.
+  // Drives on-demand GPS: we only poll the GPS while this is true (battery).
+  final _wantedController = StreamController<bool>.broadcast();
+  Stream<bool> get wantedChanges => _wantedController.stream;
+
   BluetoothDevice? _device;
   // Control-service characteristics.
   BluetoothCharacteristic? _register, _auth, _capability, _connInfo;
@@ -87,6 +92,10 @@ class CanonBle {
 
   void _log(String m) {
     if (!_logController.isClosed) _logController.add(m);
+  }
+
+  void _emitWanted(bool v) {
+    if (!_wantedController.isClosed) _wantedController.add(v);
   }
 
   // ---- identity (persisted once, replayed every connect) -------------------
@@ -389,10 +398,12 @@ class CanonBle {
     if (value.isEmpty) return;
     switch (value[0]) {
       case 1:
+        if (_gpsWanted) _emitWanted(false);
         _gpsWanted = false;
         _cameraWantsLocation = false;
         _log('Camera GPS: not wanted');
       case 2:
+        if (!_gpsWanted) _emitWanted(true);
         _gpsWanted = true;
         _cameraWantsLocation = true;
         _log('Camera GPS: WANTED — streaming location over BLE');
@@ -428,6 +439,7 @@ class CanonBle {
     _register = _auth = _capability = _connInfo = null;
     _gpsCommand = _gpsSelect = null;
     _cameraWantsLocation = false;
+    if (_gpsWanted) _emitWanted(false);
     _gpsWanted = false;
     _ready = false;
     _handshaking = false;
@@ -453,5 +465,6 @@ class CanonBle {
     }
     _stateController.close();
     _logController.close();
+    _wantedController.close();
   }
 }

@@ -5,8 +5,9 @@ import 'package:geolocator/geolocator.dart';
 import 'log_db.dart';
 import 'nmea.dart';
 
-/// Background GPS logger. Mirrors Canon's `i4.n` location config:
-/// PRIORITY_HIGH_ACCURACY, 10 s interval (5 s fastest).
+/// On-demand GPS logger. Runs inside the foreground-service isolate. To save
+/// battery it only polls location while a camera actually wants it; the update
+/// interval is user-configurable.
 class GpsService {
   GpsService(this._db);
   final GpsLogDb _db;
@@ -14,30 +15,40 @@ class GpsService {
   StreamSubscription<Position>? _sub;
   NmeaFix? _last;
   int? _termStart;
+  int _intervalSeconds = 10;
 
   final _fixController = StreamController<NmeaFix>.broadcast();
   Stream<NmeaFix> get fixes => _fixController.stream;
   NmeaFix? get lastFix => _last;
   bool get running => _sub != null;
+  int get intervalSeconds => _intervalSeconds;
 
-  // Canon: locationRequest interval 10000ms, fastest 5000ms, HIGH_ACCURACY.
-  static final _settings = AndroidSettings(
-    accuracy: LocationAccuracy.high,
-    intervalDuration: const Duration(seconds: 10),
-    distanceFilter: 0,
-    foregroundNotificationConfig: const ForegroundNotificationConfig(
-      notificationTitle: 'Canon GPS Connect',
-      notificationText: 'Logging location for your camera',
-      enableWakeLock: true,
-    ),
-  );
+  AndroidSettings _settings(int seconds) => AndroidSettings(
+        accuracy: LocationAccuracy.high,
+        intervalDuration: Duration(seconds: seconds),
+        // Don't gate on distance — a stationary camera still wants periodic fixes.
+        distanceFilter: 0,
+      );
 
-  Future<void> start() async {
+  /// Start polling at [seconds] interval. Safe to call repeatedly.
+  Future<void> start({int? seconds}) async {
+    if (seconds != null) _intervalSeconds = seconds;
     if (_sub != null) return;
     _termStart = DateTime.now().toUtc().millisecondsSinceEpoch;
     await _db.beginTerm(_termStart!);
-    _sub = Geolocator.getPositionStream(locationSettings: _settings)
+    _sub = Geolocator.getPositionStream(locationSettings: _settings(_intervalSeconds))
         .listen(_onPosition, onError: (_) {});
+  }
+
+  /// Change the interval; restarts the stream if currently running.
+  Future<void> setInterval(int seconds) async {
+    _intervalSeconds = seconds;
+    if (_sub != null) {
+      await _sub!.cancel();
+      _sub = Geolocator.getPositionStream(
+              locationSettings: _settings(_intervalSeconds))
+          .listen(_onPosition, onError: (_) {});
+    }
   }
 
   Future<void> stop() async {
