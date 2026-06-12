@@ -115,7 +115,7 @@ class CanonTaskHandler extends TaskHandler {
 
   void _notify(String text) {
     FlutterForegroundTask.updateService(
-      notificationTitle: 'Canon GPS Connect',
+      notificationTitle: 'CamConnect GPS',
       notificationText: text,
     );
   }

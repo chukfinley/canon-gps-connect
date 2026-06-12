@@ -17,7 +17,7 @@ class CanonGpsApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Canon GPS Connect',
+      title: 'CamConnect GPS',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorSchemeSeed: const Color(0xFFE60012),
@@ -69,7 +69,7 @@ class _HomePageState extends State<HomePage> {
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'canon_gps',
-        channelName: 'Canon GPS Connect',
+        channelName: 'CamConnect GPS',
         channelDescription: 'Keeps the camera connection and GPS alive',
         onlyAlertOnce: true,
       ),
@@ -133,7 +133,7 @@ class _HomePageState extends State<HomePage> {
     if (!await _ensurePermissions()) return;
     await FlutterForegroundTask.startService(
       serviceId: 256,
-      notificationTitle: 'Canon GPS Connect',
+      notificationTitle: 'CamConnect GPS',
       notificationText: 'Searching for your camera…',
       callback: startCallback,
     );
@@ -173,7 +173,7 @@ class _HomePageState extends State<HomePage> {
     final cs = Theme.of(context).colorScheme;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Canon GPS Connect'),
+        title: const Text('CamConnect GPS'),
         actions: [
           IconButton(
             tooltip: 'Forget camera',
