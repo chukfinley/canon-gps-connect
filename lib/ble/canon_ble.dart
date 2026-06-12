@@ -123,10 +123,25 @@ class CanonBle {
   Future<void> _savePaired(String id) async =>
       (await SharedPreferences.getInstance()).setString(_prefPaired, id);
 
+  // Per-camera "already registered" flag. Once the camera has accepted our GUID
+  // (indicate 0x02 on 00010006), we NEVER re-run the register write — that is
+  // what makes it "register once, then silently reconnect". (C0276o.B(): the
+  // 00010006 write only runs when the camera advertises it needs pairing.)
+  String _regKey(String id) => 'registered_$id';
+
+  Future<bool> _isRegistered(String id) async =>
+      (await SharedPreferences.getInstance()).getBool(_regKey(id)) ?? false;
+
+  Future<void> _setRegistered(String id) async =>
+      (await SharedPreferences.getInstance()).setBool(_regKey(id), true);
+
   Future<void> forget() async {
     _wantConnection = false;
     await _device?.disconnect();
-    (await SharedPreferences.getInstance()).remove(_prefPaired);
+    final prefs = await SharedPreferences.getInstance();
+    final id = _device?.remoteId.str ?? prefs.getString(_prefPaired);
+    if (id != null) await prefs.remove(_regKey(id));
+    await prefs.remove(_prefPaired);
     _device = null;
     _setState(LinkState.idle);
   }
@@ -241,25 +256,34 @@ class CanonBle {
 
     final guid = await _identityGuid();
     final nick = await _nickBytes();
+    final id = device.remoteId.str;
+    final alreadyRegistered = await _isRegistered(id);
 
     // 1) Enable indicate on camera-state char.
     if (state != null) await state.setNotifyValue(true);
-
-    // 2) Register: write 0x01 + nickname, enable indicate, await OK (0x02).
-    _setState(LinkState.registering);
     await _register!.setNotifyValue(true);
-    final regOk = _register!.onValueReceived
-        .firstWhere((v) => v.isNotEmpty && (v[0] == 0x02 || v[0] == 0x03))
-        .timeout(const Duration(seconds: 90), onTimeout: () => const [0x03]);
-    await _register!.write([0x01, ...nick], withoutResponse: false);
-    _log('Registering as "${String.fromCharCodes(nick)}" — confirm on the camera if asked');
-    final reg = await regOk;
-    if (reg.isEmpty || reg[0] != 0x02) {
-      throw StateError(
-          'Camera rejected registration (got ${reg.isEmpty ? "none" : reg[0]}). '
-          'On the camera: Wi-Fi/Bluetooth → connect to smartphone → register this app.');
+
+    // 2) Register — ONLY the first time. After the camera has accepted our GUID
+    //    we skip this entirely and just reconnect+auth (the "connect once" path).
+    if (!alreadyRegistered) {
+      _setState(LinkState.registering);
+      final regOk = _register!.onValueReceived
+          .firstWhere((v) => v.isNotEmpty && (v[0] == 0x02 || v[0] == 0x03))
+          .timeout(const Duration(seconds: 90), onTimeout: () => const [0x03]);
+      await _register!.write([0x01, ...nick], withoutResponse: false);
+      _log('First-time registration as "${String.fromCharCodes(nick)}" — '
+          'confirm on the camera (connect to smartphone → register device)');
+      final reg = await regOk;
+      if (reg.isEmpty || reg[0] != 0x02) {
+        throw StateError(
+            'Camera rejected registration (got ${reg.isEmpty ? "none" : reg[0]}). '
+            'On the camera: Wi-Fi/Bluetooth → connect to smartphone → register this app, then retry.');
+      }
+      await _setRegistered(id);
+      _log('Registered & saved — future connects are automatic');
+    } else {
+      _log('Already registered — reconnecting');
     }
-    _log('Registered (camera OK)');
 
     // 3) Read capability flags (drives feature availability).
     try {
